@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
+    LLGUIDANCE = auto()
 
     @classmethod
     def from_string(cls, name: Optional[str]) -> SpeculativeAlgorithm:
@@ -44,6 +45,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+    
+    def is_llguidance(self) -> bool:
+        return self == SpeculativeAlgorithm.LLGUIDANCE
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -83,6 +87,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_llguidance():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.llguidance_worker import LlguidanceWorker
+
+            return LlguidanceWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
