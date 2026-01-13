@@ -2177,7 +2177,7 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
-            
+
         if self.speculative_algorithm == "LLGUIDANCE":
             # llguidance must be used as grammar backend
             assert self.grammar_backend == "llguidance", (
