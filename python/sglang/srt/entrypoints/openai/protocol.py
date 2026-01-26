@@ -545,6 +545,8 @@ class ChatCompletionRequest(BaseModel):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    guidance_controller: Optional[Dict[str, Any]] = None
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -665,6 +667,7 @@ class ChatCompletionRequest(BaseModel):
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
+            "guidance_controller": self.guidance_controller,
         }
 
         if self.response_format and self.response_format.type == "json_schema":

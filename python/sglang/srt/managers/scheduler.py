@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import time
+import copy
 from collections import deque
 from concurrent import futures
 from contextlib import nullcontext
@@ -1081,12 +1082,61 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+
+        import uuid
+        from guidance_control import SMCController
+        def weight_function(tokens: list[int]) -> float:
+            """Return log weight for this token sequence."""
+            # Example: favor sequences containing specific patterns
+            return 0.0  # Uniform weighting
+
+        class GuidanceControllScheduler:
+            def __init__(self):
+                self.parent_dicts: dict = {}
+                self.children_parents_mapper: dict = {}
+
+        self.guidance_controll_scheduler = GuidanceControllScheduler()
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
+
+            for idx in range(len(recv_reqs)):
+                recv_req = recv_reqs[idx]
+                _id = recv_req.rid
+                if recv_req.sampling_params.guidance_controller is not None:
+                    guidance_controller = recv_req.sampling_params.guidance_controller
+                    controller = None
+                    if guidance_controller["type"] == "SMC":
+                        guidance_controller_params = guidance_controller["params"]
+                        controller = SMCController(
+                            num_particles=guidance_controller_params["num_particles"],
+                            resample_threshold=guidance_controller_params.get("resample_threshold", 0.5),  # Resample when ESS < 50% of particles
+                            weight_function=weight_function,
+                            max_length=recv_req.sampling_params.max_new_tokens,
+                            eos_token_id=self.tokenizer.eos_token_id
+                        )                        
+
+                        controller.init(_id, recv_req.input_ids)
+                        self.guidance_controll_scheduler.parent_dicts[_id] = {
+                            "controller": controller,
+                            "children": []
+                        }
+
+                    result = controller.pre_process(_id)
+                    if result.action == "fork":
+                        for i in range(result.num_forks - 1):
+                            cloned_recv_req = copy.deepcopy(recv_req)
+                            cloned_recv_req.rid = uuid.uuid4().hex
+                            
+                            self.guidance_controll_scheduler.children_parents_mapper[cloned_recv_req.rid] = _id                            
+                            self.guidance_controll_scheduler.parent_dicts[_id]["children"].append(cloned_recv_req.rid)
+                            recv_reqs.append(cloned_recv_req)
+                            controller.post_fork(_id, [cloned_recv_req.rid])
+
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
-                continue
+                continue            
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
