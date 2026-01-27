@@ -13,13 +13,13 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import copy
 import faulthandler
 import logging
 import os
 import signal
 import sys
 import time
-import copy
 from collections import deque
 from concurrent import futures
 from contextlib import nullcontext
@@ -1084,59 +1084,149 @@ class Scheduler(
         """A normal scheduler loop."""
 
         import uuid
-        from guidance_control import SMCController
+
+        from guidance_control import (
+            BeamSearchController,
+            BestOfNController,
+            SMCController,
+        )
+
         def weight_function(tokens: list[int]) -> float:
             """Return log weight for this token sequence."""
             # Example: favor sequences containing specific patterns
             return 0.0  # Uniform weighting
 
         class GuidanceControllScheduler:
-            def __init__(self):
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
                 self.parent_dicts: dict = {}
                 self.children_parents_mapper: dict = {}
 
-        self.guidance_controll_scheduler = GuidanceControllScheduler()
+            def init_new_request(
+                self, req_id: str, controller_desc: dict, input_tokens: list[int]
+            ):
+                assert (
+                    req_id not in self.parent_dicts
+                ), "Parent request ID already exists."
+
+                assert (
+                    req_id not in self.children_parents_mapper
+                ), "Child request ID cannot be a parent."
+
+                controller = self._init_controller(controller_desc)
+                controller.init(req_id, input_tokens)
+
+                self.parent_dicts[req_id] = {"controller": controller, "children": []}
+
+            def _init_controller(self, controller_desc: dict):
+                controller = None
+                if controller_desc["type"] == "SMC":
+                    guidance_controller_params = controller_desc["params"]
+                    controller = SMCController(
+                        num_particles=guidance_controller_params["num_particles"],
+                        resample_threshold=guidance_controller_params.get(
+                            "resample_threshold", 0.5
+                        ),  # Resample when ESS < 50% of particles
+                        weight_function=weight_function,
+                        max_length=recv_req.sampling_params.max_new_tokens,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                return controller
+
+            def get_controller(
+                self, rid: str
+            ) -> SMCController | BestOfNController | BeamSearchController:
+                if rid in self.parent_dicts:
+                    return self.parent_dicts[rid]["controller"]
+                elif rid in self.children_parents_mapper:
+                    parent_id = self.children_parents_mapper[rid]
+                    return self.parent_dicts[parent_id]["controller"]
+                else:
+                    raise ValueError(
+                        f"Request ID {rid} not found in parent or child mappings."
+                    )
+
+            def add_child(self, parent_id: str, child_id: str):
+                self.children_parents_mapper[child_id] = parent_id
+                self.parent_dicts[parent_id]["children"].append(child_id)
+
+            def get_parent_id(self, rid: str) -> str:
+                if rid in self.parent_dicts:
+                    return rid
+                elif rid in self.children_parents_mapper:
+                    return self.children_parents_mapper[rid]
+                else:
+                    raise ValueError(
+                        f"Request ID {rid} not found in parent or child mappings."
+                    )
+
+            def get_children_ids(self, parent_id: str) -> list[str]:
+                return copy.deepcopy(self.parent_dicts[parent_id]["children"])
+
+            def is_guidance_request(self, rid: str) -> bool:
+                return rid in self.parent_dicts or rid in self.children_parents_mapper
+
+            def is_parent_request(self, rid: str) -> bool:
+                return rid in self.parent_dicts
+
+        self.guidance_controll_scheduler = GuidanceControllScheduler(self.tokenizer)
 
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
 
-            for idx in range(len(recv_reqs)):
-                recv_req = recv_reqs[idx]
-                _id = recv_req.rid
+            new_reqs = []
+            for idx, recv_req in enumerate(recv_reqs):
+                rid = recv_req.rid
                 if recv_req.sampling_params.guidance_controller is not None:
-                    guidance_controller = recv_req.sampling_params.guidance_controller
-                    controller = None
-                    if guidance_controller["type"] == "SMC":
-                        guidance_controller_params = guidance_controller["params"]
-                        controller = SMCController(
-                            num_particles=guidance_controller_params["num_particles"],
-                            resample_threshold=guidance_controller_params.get("resample_threshold", 0.5),  # Resample when ESS < 50% of particles
-                            weight_function=weight_function,
-                            max_length=recv_req.sampling_params.max_new_tokens,
-                            eos_token_id=self.tokenizer.eos_token_id
-                        )                        
+                    # guidance_controller = recv_req.sampling_params.guidance_controller
+                    # controller = None
+                    # if guidance_controller["type"] == "SMC":
+                    #     guidance_controller_params = guidance_controller["params"]
+                    #     controller = SMCController(
+                    #         num_particles=guidance_controller_params["num_particles"],
+                    #         resample_threshold=guidance_controller_params.get("resample_threshold", 0.5),  # Resample when ESS < 50% of particles
+                    #         weight_function=weight_function,
+                    #         max_length=recv_req.sampling_params.max_new_tokens,
+                    #         eos_token_id=self.tokenizer.eos_token_id
+                    #     )
 
-                        controller.init(_id, recv_req.input_ids)
-                        self.guidance_controll_scheduler.parent_dicts[_id] = {
-                            "controller": controller,
-                            "children": []
-                        }
+                    #     controller.init(_id, recv_req.input_ids)
+                    #     self.guidance_controll_scheduler.parent_dicts[_id] = {
+                    #         "controller": controller,
+                    #         "children": []
+                    #     }
 
-                    result = controller.pre_process(_id)
+                    self.guidance_controll_scheduler.init_new_request(
+                        rid,
+                        recv_req.sampling_params.guidance_controller,
+                        recv_req.input_ids,
+                    )
+
+                    result = self.guidance_controll_scheduler.get_controller(
+                        rid
+                    ).pre_process(rid)
                     if result.action == "fork":
                         for i in range(result.num_forks - 1):
                             cloned_recv_req = copy.deepcopy(recv_req)
                             cloned_recv_req.rid = uuid.uuid4().hex
-                            
-                            self.guidance_controll_scheduler.children_parents_mapper[cloned_recv_req.rid] = _id                            
-                            self.guidance_controll_scheduler.parent_dicts[_id]["children"].append(cloned_recv_req.rid)
-                            recv_reqs.append(cloned_recv_req)
-                            controller.post_fork(_id, [cloned_recv_req.rid])
+
+                            # self.guidance_controll_scheduler.children_parents_mapper[cloned_recv_req.rid] = rid
+                            # self.guidance_controll_scheduler.parent_dicts[rid]["children"].append(cloned_recv_req.rid)
+
+                            self.guidance_controll_scheduler.add_child(
+                                rid, cloned_recv_req.rid
+                            )
+                            new_reqs.append(cloned_recv_req)
+                            self.guidance_controll_scheduler.get_controller(
+                                rid
+                            ).post_fork(rid, [cloned_recv_req.rid])
+            recv_reqs.extend(new_reqs)
 
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
-                continue            
+                continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2005,8 +2095,36 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
-        # Get requests from the waiting queue to a new prefill batch
+        guidance_parent_to_reqs = {}
+        non_guidance_reqs = []
         for req in self.waiting_queue:
+            if not self.guidance_controll_scheduler.is_guidance_request(req.rid):
+                non_guidance_reqs.append(req)
+                continue
+
+            parent_rid = self.guidance_controll_scheduler.get_parent_id(req.rid)
+            if parent_rid not in guidance_parent_to_reqs:
+                guidance_parent_to_reqs[parent_rid] = []
+
+            guidance_parent_to_reqs[parent_rid].append(req)
+
+        guidance_reqs_to_add = []
+        for parent_rid, reqs in guidance_parent_to_reqs.items():
+            if (
+                len(reqs)
+                != len(self.guidance_controll_scheduler.get_children_ids(parent_rid))
+                + 1
+            ):
+                continue
+
+            # TODO: we need to check if the deployment has enough resources to run all guidance requests in a single batch
+
+            guidance_reqs_to_add.extend(reqs)
+
+        # Get requests from the waiting queue to a new prefill batch
+        waiting_queue = guidance_reqs_to_add + non_guidance_reqs
+        # for req in self.waiting_queue:
+        for req in waiting_queue:
 
             if self.enable_lora:
                 new_lora_set = (
