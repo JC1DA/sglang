@@ -66,6 +66,11 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    is_guidance_reqs_list: Optional[List[bool]] = None
+    guidance_logits: Optional[torch.Tensor] = None
+    guidance_biases: Optional[torch.Tensor] = None
+    guidance_log_L_list: Optional[List[torch.Tensor | None]] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -162,6 +167,12 @@ class SamplingBatchInfo:
             },
         )
 
+        is_guidance_reqs_list = []
+        for r in reqs:
+            sampling_params = r.sampling_params
+            if sampling_params.guidance_controller is not None:
+                is_guidance_reqs_list.append(True)
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -179,6 +190,7 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            is_guidance_reqs_list=is_guidance_reqs_list,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -242,6 +254,12 @@ class SamplingBatchInfo:
             self.penalizer_orchestrator.apply(logits)
 
         if self.vocab_mask is not None:
+            # clone logits for guidance-usecases
+            self.guidance_logits = logits.clone().to(logits.device)
+            self.guidance_biases = torch.zeros_like(logits).to(logits.device)
+            self.apply_mask_func(
+                logits=self.guidance_biases, vocab_mask=self.vocab_mask
+            )
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
         if self.logit_bias is not None:
@@ -263,6 +281,11 @@ class SamplingBatchInfo:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
+
+        _is_guidance_reqs_list = []
+        for i in keep_indices:
+            _is_guidance_reqs_list.append(self.is_guidance_reqs_list[i])
+        self.is_guidance_reqs_list = _is_guidance_reqs_list
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -375,6 +398,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+        self.is_guidance_reqs_list += other.is_guidance_reqs_list
 
         self.adjusted_merge_batch(other)
 

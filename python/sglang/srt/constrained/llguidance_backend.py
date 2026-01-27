@@ -105,6 +105,16 @@ class GuidanceGrammar(BaseGrammarObject):
     ):
         pass
 
+    def rollback(self, k: int):
+        self.ll_matcher.rollback(k)
+
+    def reset(self):
+        self.ll_matcher = LLMatcher(
+            self.llguidance_tokenizer,
+            self.serialized_grammar,
+            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+        )
+
 
 class GuidanceBackend(BaseGrammarBackend):
 

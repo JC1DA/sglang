@@ -117,12 +117,70 @@ class Sampler(nn.Module):
                 )
 
             # Post process logits
-            logits.div_(sampling_info.temperatures)
-            # For ascend backend, softmax is not needed before sampling
-            if not get_global_server_args().sampling_backend == "ascend" or (
-                return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
+            if sampling_info.is_guidance_reqs_list and any(
+                sampling_info.is_guidance_reqs_list
             ):
-                logits[:] = torch.softmax(logits, dim=-1)
+
+                def logsumexp(a: torch.Tensor) -> torch.Tensor:
+                    a_max = torch.max(a)
+                    return a_max + torch.log(torch.sum(torch.exp(a - a_max)))
+
+                def compute_modified_probs_and_sum(
+                    _logits: torch.Tensor, _bias: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                    log_Z = logsumexp(_logits)
+                    log_Z_prime = logsumexp(_logits + _bias)
+
+                    p_prime = torch.exp(_logits + _bias - log_Z_prime)
+                    log_L = log_Z_prime - log_Z
+
+                    return p_prime, log_L
+
+                if sampling_info.guidance_logits is None:
+                    sampling_info.guidance_logits = logits.clone().to(logits.device)
+                if sampling_info.guidance_biases is None:
+                    sampling_info.guidance_biases = torch.zeros_like(logits).to(
+                        logits.device
+                    )
+
+                sampling_info.guidance_log_L_list = []
+                _original_logits = logits
+                _original_logits.div_(sampling_info.temperatures)
+                _original_logits[:] = torch.softmax(logits, dim=-1)
+
+                logits = sampling_info.guidance_logits
+                biases = sampling_info.guidance_biases
+                logits.div_(sampling_info.temperatures)
+                biases.div_(sampling_info.temperatures)
+                # logits[:] = torch.softmax(logits, dim=-1)
+
+                for i, is_guidance_req in enumerate(
+                    sampling_info.is_guidance_reqs_list
+                ):
+                    if not is_guidance_req:
+                        logits[i] = _original_logits[i]
+                        sampling_info.guidance_log_L_list.append(None)
+                    else:
+                        _logits = logits[i]
+                        _bias = biases[i]
+
+                        probs, correction = compute_modified_probs_and_sum(
+                            _logits, _bias
+                        )
+                        logits[i] = probs
+
+                        # _logits = _logits.reshape(1, -1)
+                        # logits[i] = torch.softmax(_logits, dim=-1)[0]
+
+                        sampling_info.guidance_log_L_list.append(correction)
+            else:
+                logits.div_(sampling_info.temperatures)
+                # For ascend backend, softmax is not needed before sampling
+                if not get_global_server_args().sampling_backend == "ascend" or (
+                    return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                ):
+                    logits[:] = torch.softmax(logits, dim=-1)
+
             probs = logits
             del logits
 

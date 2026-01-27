@@ -116,6 +116,9 @@ class BaseGrammarObject:
         """
         raise NotImplementedError()
 
+    def reset(self):
+        raise NotImplementedError()
+
 
 INVALID_GRAMMAR_OBJ = BaseGrammarObject()
 
