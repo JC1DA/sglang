@@ -1180,24 +1180,6 @@ class Scheduler(
             for idx, recv_req in enumerate(recv_reqs):
                 rid = recv_req.rid
                 if recv_req.sampling_params.guidance_controller is not None:
-                    # guidance_controller = recv_req.sampling_params.guidance_controller
-                    # controller = None
-                    # if guidance_controller["type"] == "SMC":
-                    #     guidance_controller_params = guidance_controller["params"]
-                    #     controller = SMCController(
-                    #         num_particles=guidance_controller_params["num_particles"],
-                    #         resample_threshold=guidance_controller_params.get("resample_threshold", 0.5),  # Resample when ESS < 50% of particles
-                    #         weight_function=weight_function,
-                    #         max_length=recv_req.sampling_params.max_new_tokens,
-                    #         eos_token_id=self.tokenizer.eos_token_id
-                    #     )
-
-                    #     controller.init(_id, recv_req.input_ids)
-                    #     self.guidance_controll_scheduler.parent_dicts[_id] = {
-                    #         "controller": controller,
-                    #         "children": []
-                    #     }
-
                     self.guidance_controll_scheduler.init_new_request(
                         rid,
                         recv_req.sampling_params.guidance_controller,
@@ -1211,9 +1193,6 @@ class Scheduler(
                         for i in range(result.num_forks - 1):
                             cloned_recv_req = copy.deepcopy(recv_req)
                             cloned_recv_req.rid = uuid.uuid4().hex
-
-                            # self.guidance_controll_scheduler.children_parents_mapper[cloned_recv_req.rid] = rid
-                            # self.guidance_controll_scheduler.parent_dicts[rid]["children"].append(cloned_recv_req.rid)
 
                             self.guidance_controll_scheduler.add_child(
                                 rid, cloned_recv_req.rid
@@ -2448,6 +2427,147 @@ class Scheduler(
                     )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+
+            # process log_Z
+            reqs = worker_batch_or_batch.reqs
+            log_L_list = worker_batch_or_batch.sampling_info.guidance_log_L_list
+            if log_L_list:
+                reqid_to_req = {}
+                reqid_to_idx = {}
+                reqid_to_next_token_id = {}
+                parent_ids = []
+                for idx, log_L in enumerate(log_L_list):
+                    if log_L is None:
+                        continue
+
+                    req = reqs[idx]
+                    reqid_to_req[req.rid] = req
+                    reqid_to_idx[req.rid] = idx
+                    if self.guidance_controll_scheduler.is_parent_request(req.rid):
+                        parent_ids.append(req.rid)
+                    next_token_id = batch_result.next_token_ids[idx].item()
+                    reqid_to_next_token_id[req.rid] = next_token_id
+                    logprob = torch.log(
+                        batch_result.logits_output.next_token_logits[idx]
+                    )[next_token_id].item()
+                    log_L = log_L.item()
+
+                    # run post-process
+                    controller = self.guidance_controll_scheduler.get_controller(
+                        req.rid
+                    )
+                    controller.post_process(req.rid, next_token_id, logprob, log_L)
+
+                for parent_id in parent_ids:
+                    _rids = [
+                        parent_id
+                    ] + self.guidance_controll_scheduler.get_children_ids(parent_id)
+                    controller = self.guidance_controll_scheduler.get_controller(
+                        parent_id
+                    )
+
+                    if controller.is_complete():
+                        continue
+
+                    to_fork = {}
+                    to_stop = []
+                    is_parent_stopping = False
+                    for _rid in _rids:
+                        r = controller.pre_process(_rid)
+                        if r.action == "fork":
+                            to_fork[_rid] = r.num_forks
+                        elif r.action == "stop":
+                            to_stop.append(_rid)
+                            if _rid == parent_id:
+                                is_parent_stopping = True
+
+                    if controller.is_complete():
+                        best_rid = controller.get_best_sequence_id()
+                        if best_rid != parent_id:
+                            # replace parent with best child
+                            to_replace_rid = parent_id
+                            new_req = reqid_to_req[to_replace_rid]
+                            _req = reqid_to_req[best_rid]
+                            new_req.output_ids = copy.deepcopy(_req.output_ids)
+
+                            old_index = reqid_to_idx[new_req.rid]
+                            new_index = reqid_to_idx[_req.rid]
+                            batch_result.next_token_ids[old_index] = (
+                                batch_result.next_token_ids[new_index]
+                            )
+                            batch.reqs[old_index].output_ids = copy.deepcopy(
+                                _req.output_ids
+                            )
+                            future_indices_or_next_token_ids[old_index] = (
+                                future_indices_or_next_token_ids[new_index]
+                            )
+
+                            new_pool_idx = new_req.req_pool_idx
+                            old_pool_idx = _req.req_pool_idx
+                            req_to_token = (
+                                self.model_worker.model_runner.req_to_token_pool.req_to_token
+                            )
+                            req_to_token[new_pool_idx, :] = req_to_token[
+                                old_pool_idx, :
+                            ]
+                            self.running_batch.input_ids[old_index] = (
+                                self.running_batch.input_ids[new_index]
+                            )
+
+                            if new_req.grammar:
+                                # new_req.grammar.rollback(old_length)  # rollback to initial state
+                                new_req.grammar.reset()  # rollback to initial state
+                                for token_id in new_req.output_ids:
+                                    new_req.grammar.accept_token(token_id)
+
+                        print("Guidance controller completed")
+                    else:
+                        if len(to_fork) > 0 or len(to_stop) > 0:
+                            print("Guidance controller decision:")
+                            print(f"  to_fork: {to_fork}")
+                            print(f"  to_stop: {to_stop}")
+                            print(f"  is_parent_stopping: {is_parent_stopping}")
+
+                        for _rid, num_forks in to_fork.items():
+                            _req = reqid_to_req[_rid]
+                            for _ in range(num_forks - 1):
+                                to_replace_rid = to_stop.pop(0)
+                                new_req = reqid_to_req[to_replace_rid]
+                                new_req.output_ids = copy.deepcopy(_req.output_ids)
+
+                                old_index = reqid_to_idx[new_req.rid]
+                                new_index = reqid_to_idx[_req.rid]
+                                batch_result.next_token_ids[old_index] = (
+                                    batch_result.next_token_ids[new_index]
+                                )
+                                batch.reqs[old_index].output_ids = copy.deepcopy(
+                                    _req.output_ids
+                                )
+                                future_indices_or_next_token_ids[old_index] = (
+                                    future_indices_or_next_token_ids[new_index]
+                                )
+
+                                new_pool_idx = new_req.req_pool_idx
+                                old_pool_idx = _req.req_pool_idx
+                                req_to_token = (
+                                    self.model_worker.model_runner.req_to_token_pool.req_to_token
+                                )
+                                req_to_token[new_pool_idx, :] = req_to_token[
+                                    old_pool_idx, :
+                                ]
+                                self.running_batch.input_ids[old_index] = (
+                                    self.running_batch.input_ids[new_index]
+                                )
+
+                                if new_req.grammar:
+                                    # new_req.grammar.rollback(old_length)  # rollback to initial state
+                                    new_req.grammar.reset()  # rollback to initial state
+                                    for token_id in new_req.output_ids:
+                                        new_req.grammar.accept_token(token_id)
+
+                                self.guidance_controll_scheduler.get_controller(
+                                    _rid
+                                ).post_fork(_rid, [to_replace_rid])
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
