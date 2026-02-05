@@ -115,6 +115,9 @@ class BaseGrammarObject:
         Jump forward occurs, and update the grammar state if needed.
         """
         raise NotImplementedError()
+    
+    def reset(self):
+        raise NotImplementedError()
 
 
 INVALID_GRAMMAR_OBJ = BaseGrammarObject()
