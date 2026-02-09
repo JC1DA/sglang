@@ -798,6 +798,8 @@ class Req:
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
+        self.guidance_controller = None
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""

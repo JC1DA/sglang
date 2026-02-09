@@ -172,6 +172,8 @@ class SamplingBatchInfo:
             sampling_params = r.sampling_params
             if sampling_params.guidance_controller is not None:
                 is_guidance_reqs_list.append(True)
+            else:
+                is_guidance_reqs_list.append(False)
 
         ret = cls(
             temperatures=temperatures,

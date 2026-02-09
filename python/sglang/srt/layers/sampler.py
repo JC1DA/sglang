@@ -117,7 +117,12 @@ class Sampler(nn.Module):
                 )
 
             # Post process logits
-            if sampling_info.is_guidance_reqs_list and any(sampling_info.is_guidance_reqs_list):
+            if (
+                False
+                and sampling_info.is_guidance_reqs_list
+                and any(sampling_info.is_guidance_reqs_list)
+            ):
+
                 def logsumexp(a: torch.Tensor) -> torch.Tensor:
                     a_max = torch.max(a)
                     return a_max + torch.log(torch.sum(torch.exp(a - a_max)))

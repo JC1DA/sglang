@@ -13,13 +13,13 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import copy
 import faulthandler
 import logging
 import os
 import signal
 import sys
 import time
-import copy
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -536,6 +536,9 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        # TODO: add tokenizer arg to speculator
+        self.draft_worker.tokenizer = self.tokenizer
 
     def init_model_worker(self):
         self.init_tp_model_worker()
@@ -1070,6 +1073,7 @@ class Scheduler(
         from guidance_control import (
             BeamSearchController,
             BestOfNController,
+            CustomController,
             SMCController,
         )
 
@@ -1085,7 +1089,11 @@ class Scheduler(
                 self.children_parents_mapper: dict = {}
 
             def init_new_request(
-                self, req_id: str, controller_desc: dict, input_tokens: list[int], max_length: int
+                self,
+                req_id: str,
+                controller_desc: dict,
+                input_tokens: list[int],
+                max_length: int,
             ):
                 assert (
                     req_id not in self.parent_dicts
@@ -1113,6 +1121,9 @@ class Scheduler(
                         max_length=max_length,
                         eos_token_id=self.tokenizer.eos_token_id,
                     )
+                elif controller_desc["type"] == "CustomController":
+                    guidance_controller_params = controller_desc["params"]
+                    controller = CustomController(self.tokenizer)
 
                 return controller
 
@@ -1193,6 +1204,14 @@ class Scheduler(
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            if batch:
+                for req in batch.reqs:
+                    if self.guidance_controll_scheduler.is_guidance_request(req.rid):
+                        controller = self.guidance_controll_scheduler.get_controller(
+                            req.rid
+                        )
+                        req.guidance_controller = controller
 
             # Launch the current batch
             if batch:
@@ -2464,7 +2483,7 @@ class Scheduler(
             # process log_Z
             reqs = worker_batch_or_batch.reqs
             log_L_list = worker_batch_or_batch.sampling_info.guidance_log_L_list
-            if log_L_list:
+            if log_L_list and not self.draft_worker:
                 reqid_to_req = {}
                 reqid_to_idx = {}
                 reqid_to_next_token_id = {}

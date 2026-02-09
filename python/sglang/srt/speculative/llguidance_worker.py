@@ -29,6 +29,9 @@ class LlguidanceWorker:
         target_worker: TpModelWorker,
     ):
         self.target_worker = target_worker
+        self.req_to_text = {}
+        self.req_to_forced_text = {}
+        self.req_to_future = {}
 
     def clear_cache_pool(self):
         pass
@@ -43,6 +46,32 @@ class LlguidanceWorker:
         model_worker_batch = batch.get_model_worker_batch()
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
 
+        decoded_tokens = self.tokenizer.batch_decode(batch_result.next_token_ids)
+        for req, token in zip(batch.reqs, decoded_tokens):
+            if req.rid not in self.req_to_text:
+                self.req_to_text[req.rid] = ""
+                self.req_to_forced_text[req.rid] = ""
+
+            self.req_to_text[req.rid] += token
+            text = self.req_to_text[req.rid]
+            if "<calling_tool>" in text and "</calling_tool>" in text:
+                self.req_to_text[req.rid] = ""
+                #                 forced_text = """<|im_end|>
+                # <|im_start|>assistant
+                # <think>
+                # TOOL_RESULT: 841265283915631 + 285623858 = 841265569539489"""
+
+                forced_text = (
+                    """\nTOOL_RESULT: 841265283915631 + 285623858 = 841265569539489"""
+                )
+                self.req_to_forced_text[req.rid] = forced_text
+
+        for i, req in enumerate(batch.reqs):
+            controller = req.guidance_controller
+            if controller:
+                next_token_id = batch_result.next_token_ids[i].cpu().item()
+                controller.post_process(req.rid, next_token_id, None, None)
+
         if to_process_output_ids:
             logits_output, next_token_ids, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -54,7 +83,12 @@ class LlguidanceWorker:
                 if req.grammar:
                     req.grammar.accept_token(next_token_ids[i].item())
 
-                req.output_ids.append(next_token_ids_cpu[i].item())
+                next_token_id = next_token_ids_cpu[i].item()
+                req.output_ids.append(next_token_id)
+
+                # controller = req.guidance_controller
+                # if controller:
+                #     controller.post_process(req.rid, next_token_id, None, None)
 
             # reset batch to decode mode
             batch.forward_mode = ForwardMode.DECODE
@@ -70,6 +104,18 @@ class LlguidanceWorker:
                 if req.grammar:
                     ff_tokens = req.grammar.ll_matcher.compute_ff_tokens()
                     # ff_tokens = []
+
+                # if req.rid in self.req_to_forced_text and self.req_to_forced_text[req.rid]:
+                #     _tokens = self.tokenizer(self.req_to_forced_text[req.rid], add_special_tokens=False).input_ids
+                #     ff_tokens.extend(_tokens)
+                #     self.req_to_forced_text[req.rid] = ""
+
+                controller = req.guidance_controller
+                if controller:
+                    preproc_result = controller.pre_process(req.rid)
+                    if preproc_result.extra_tokens:
+                        ff_tokens.extend(preproc_result.extra_tokens)
+
                 ff_tokens_list.append(ff_tokens)
                 max_ff_tokens_len = max(max_ff_tokens_len, len(ff_tokens))
 
@@ -86,7 +132,8 @@ class LlguidanceWorker:
                     ff_tokens = ff_tokens_list[i]
                     # accept ff_tokens
                     for token in ff_tokens:
-                        req.grammar.accept_token(token)
+                        if req.grammar:
+                            req.grammar.accept_token(token)
                         req.output_ids.append(token)
 
                     new_input_ids.append(batch.input_ids[i].item())
