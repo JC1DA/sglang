@@ -1,0 +1,27 @@
+[tool.uv.workspace]
+members = ["guidance_control", "engine-transformers"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = [".git", ".venv"]
+lint.select = [
+  "B",        # flake8-bugbear
+  "I",        # isort
+  "ARG",      # flake8-unused-arguments
+  "C4",       # flake8-comprehensions
+  "F",
+  "BLE",
+  "UP",
+  "RUF"
+]
+
+[tool.mypy]
+disallow_untyped_defs=true
+
+[dependency-groups]
+dev = [
+    "ipython>=8.37.0",
+    "mypy>=1.18.2",
+    "ruff>=0.14.5",
+]

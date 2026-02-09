@@ -1,0 +1,21 @@
+[project]
+name = "engine-transformers"
+version = "0.0.1"
+description = "Reference engine implementation using HuggingFace transformers"
+readme = "README.md"
+authors = [
+    { name = "Guidance Maintainers", email = "maintainers@guidance-ai.org" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "guidance-control",
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+]
+
+[tool.uv.sources]
+guidance-control = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
