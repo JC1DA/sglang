@@ -29,9 +29,6 @@ class LlguidanceWorker:
         target_worker: TpModelWorker,
     ):
         self.target_worker = target_worker
-        self.req_to_text = {}
-        self.req_to_forced_text = {}
-        self.req_to_future = {}
 
     def clear_cache_pool(self):
         pass
@@ -45,26 +42,6 @@ class LlguidanceWorker:
 
         model_worker_batch = batch.get_model_worker_batch()
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-
-        decoded_tokens = self.tokenizer.batch_decode(batch_result.next_token_ids)
-        for req, token in zip(batch.reqs, decoded_tokens):
-            if req.rid not in self.req_to_text:
-                self.req_to_text[req.rid] = ""
-                self.req_to_forced_text[req.rid] = ""
-
-            self.req_to_text[req.rid] += token
-            text = self.req_to_text[req.rid]
-            if "<calling_tool>" in text and "</calling_tool>" in text:
-                self.req_to_text[req.rid] = ""
-                #                 forced_text = """<|im_end|>
-                # <|im_start|>assistant
-                # <think>
-                # TOOL_RESULT: 841265283915631 + 285623858 = 841265569539489"""
-
-                forced_text = (
-                    """\nTOOL_RESULT: 841265283915631 + 285623858 = 841265569539489"""
-                )
-                self.req_to_forced_text[req.rid] = forced_text
 
         for i, req in enumerate(batch.reqs):
             controller = req.guidance_controller
@@ -103,12 +80,6 @@ class LlguidanceWorker:
                 ff_tokens = []
                 if req.grammar:
                     ff_tokens = req.grammar.ll_matcher.compute_ff_tokens()
-                    # ff_tokens = []
-
-                # if req.rid in self.req_to_forced_text and self.req_to_forced_text[req.rid]:
-                #     _tokens = self.tokenizer(self.req_to_forced_text[req.rid], add_special_tokens=False).input_ids
-                #     ff_tokens.extend(_tokens)
-                #     self.req_to_forced_text[req.rid] = ""
 
                 controller = req.guidance_controller
                 if controller:
