@@ -483,7 +483,127 @@ the process. Only when `lock_ref` drops to 0 does a node become evictable.
 
 ---
 
-## 6. Complete Request Lifecycle
+## 6. `assign_req_to_token_pool` (Speculative Decoding Helper)
+
+**File:** `python/sglang/srt/speculative/spec_utils.py:88`
+
+In the standard prefill/decode paths described above, `write_cache_indices()`
+writes the mapping from token positions to KV pool indices into
+`req_to_token`. However, speculative decoding workflows (ngram, EAGLE,
+llguidance) use a different Triton kernel called `assign_req_to_token_pool`
+for the same purpose. This kernel is simpler because speculative decoding
+does not deal with prefix sharing -- it only needs to write newly allocated
+KV indices into a contiguous range of positions for each request.
+
+### Signature
+
+```python
+@triton.jit
+def assign_req_to_token_pool(
+    req_pool_indices,   # [bs] request slot indices (row indices into req_to_token)
+    req_to_token,       # [max_num_reqs, max_context_len] the mapping table
+    start_offset,       # [bs] start position in each request's row to begin writing
+    end_offset,         # [bs] end position (exclusive) in each request's row
+    out_cache_loc,      # [total_new_tokens] flat array of allocated KV pool indices
+    pool_len,           # max_context_len (number of columns per row)
+    bs_upper,           # next_power_of_2(batch_size), used for masking
+):
+```
+
+There is also a convenience wrapper `assign_req_to_token_pool_func()` (line
+122) that calls the kernel with the correct grid size and computes
+`bs_upper` automatically.
+
+### How It Works
+
+Each Triton program instance handles one request (identified by `pid =
+tl.program_id(0)`).
+
+**Step 1 -- Locate the request's row and range.**
+
+```python
+kv_start = tl.load(start_offset + pid)
+kv_end   = tl.load(end_offset + pid)
+token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+```
+
+`token_pool` points to the beginning of this request's row in `req_to_token`.
+The kernel will write into columns `kv_start` through `kv_end - 1`.
+
+**Step 2 -- Compute the offset into `out_cache_loc`.**
+
+`out_cache_loc` is a flat 1D tensor holding the newly allocated KV indices for
+**all** requests concatenated together. Each program needs to know where its
+slice starts. It computes this by summing the lengths of all preceding
+requests:
+
+```python
+length_offset = tl.arange(0, bs_upper)
+start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
+end   = tl.load(end_offset   + length_offset, mask=length_offset < pid, other=0)
+out_offset = tl.sum(end - start, axis=0)
+```
+
+For request `pid`, `out_offset = sum of (end[i] - start[i]) for i in
+0..pid-1`. This is the cumulative number of tokens belonging to earlier
+requests, giving the starting index into `out_cache_loc`.
+
+**Step 3 -- Copy KV indices into the request's row.**
+
+The kernel loops over the range `[kv_start, kv_end)` in blocks of 32,
+reading from `out_cache_loc[out_offset:]` and writing into
+`token_pool[kv_start:]`:
+
+```python
+for _ in range(num_loop):
+    mask = save_offset < kv_end
+    data = tl.load(out_cache_ptr + load_offset, mask=mask)
+    tl.store(token_pool + save_offset, data, mask=mask)
+    save_offset += BLOCK_SIZE
+    load_offset += BLOCK_SIZE
+```
+
+### Example
+
+```
+Batch of 3 requests during speculative decoding:
+
+  Request 0: req_pool_idx=2, start=5, end=8  → needs 3 new KV slots
+  Request 1: req_pool_idx=7, start=3, end=5  → needs 2 new KV slots
+  Request 2: req_pool_idx=1, start=6, end=9  → needs 3 new KV slots
+
+  out_cache_loc = [40, 41, 42, 55, 56, 70, 71, 72]
+                   ╰─ req 0 ─╯  ╰ req1╯  ╰─ req 2 ─╯
+
+  Program 0 (pid=0):
+    out_offset = 0  (no preceding requests)
+    Writes out_cache_loc[0:3] → req_to_token[2, 5:8] = [40, 41, 42]
+
+  Program 1 (pid=1):
+    out_offset = (8-5) = 3
+    Writes out_cache_loc[3:5] → req_to_token[7, 3:5] = [55, 56]
+
+  Program 2 (pid=2):
+    out_offset = (8-5) + (5-3) = 5
+    Writes out_cache_loc[5:8] → req_to_token[1, 6:9] = [70, 71, 72]
+```
+
+### Comparison with `write_cache_indices`
+
+| Aspect | `write_cache_indices` | `assign_req_to_token_pool` |
+|--------|----------------------|---------------------------|
+| Used by | Standard prefill/decode (`alloc_for_extend`) | Speculative decoding (ngram, EAGLE, llguidance) |
+| Prefix handling | Writes both prefix indices and new indices | Writes only new indices (no prefix region) |
+| Input range | Derived from `prefix_lens` and `seq_lens` | Explicit `start_offset` and `end_offset` |
+| Typical call site | `common.py:377` | `spec_utils.py:130`, `ngram_info.py:112`, `llguidance_worker.py:129` |
+
+Both kernels achieve the same end result: populating `req_to_token[req_idx,
+start:end]` with KV pool indices so the attention kernels can locate each
+token's cached K/V data.
+
+---
+
+## 7. Complete Request Lifecycle
 
 ```
 1. REQUEST ARRIVES
